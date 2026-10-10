@@ -1,21 +1,18 @@
+import argparse
 import datetime
 import time
 import os
 import io
-import base64
+import smtplib
+import html
 from email.message import EmailMessage
+from email.utils import make_msgid, parseaddr
 
-from PIL import Image
 from loguru import logger
 from dotenv import load_dotenv
 
-import google.auth
 from google.oauth2 import service_account
-from googleapiclient.http import MediaFileUpload
 from googleapiclient.http import MediaIoBaseDownload
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 from aspose.cells import Workbook
@@ -35,16 +32,23 @@ def get_env(name, default=None):
     return value
 
 # Get date today
-DATE = datetime.datetime.now()
-DATE_FORMAT_1 = f"{DATE.strftime('%B')} {DATE.day}, {DATE.year}"
-DATE_FORMAT_2 = DATE.strftime("%Y-%m-%d")
-DATE_FORMAT_3 = DATE.strftime("%Y%m")
+def set_report_date(date):
+    """Set the date used for the worksheet, the block to find, and the email."""
+    global DATE, DATE_FORMAT_1, DATE_FORMAT_2, DATE_FORMAT_3
+    DATE = date
+    DATE_FORMAT_1 = f"{DATE.strftime('%B')} {DATE.day}, {DATE.year}"
+    DATE_FORMAT_2 = DATE.strftime("%Y-%m-%d")
+    DATE_FORMAT_3 = DATE.strftime("%Y%m")
 
-# If modifying these scopes, delete the file token.json.
+set_report_date(datetime.datetime.now())
+
+# The service account only needs to read files from the shared drive
 SCOPES = [
-    "https://www.googleapis.com/auth/drive",
-    "https://mail.google.com/"
+    "https://www.googleapis.com/auth/drive.readonly"
 ]
+
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 465
 
 SHARED_DRIVE_ID = get_env("SHARED_DRIVE_ID")
 
@@ -56,33 +60,25 @@ MESSAGE_TO = get_env("MESSAGE_TO")
 MESSAGE_CC = os.getenv("MESSAGE_CC", "")
 MESSAGE_FROM = get_env("MESSAGE_FROM")
 
+# Gmail app password for MESSAGE_FROM; Google shows it with spaces, which are not part of it
+GMAIL_APP_PASSWORD = get_env("GMAIL_APP_PASSWORD").replace(" ", "")
+
+SERVICE_ACCOUNT_FILE = get_env("SERVICE_ACCOUNT_FILE", "sa-key.json")
+
 EMAIL_SUBJECT = get_env("EMAIL_SUBJECT", "Sample")
 REPORT_NAME = get_env("REPORT_NAME", "sample report")
 REPORT_LINK = os.getenv("REPORT_LINK", "")
+REPORT_LINK_LABEL = get_env("REPORT_LINK_LABEL", "Report Link")
 SENDER_NAME = get_env("SENDER_NAME", "Sample")
 
+# Width in pixels the screenshot is shown at in the email body
+EMAIL_IMAGE_WIDTH = int(get_env("EMAIL_IMAGE_WIDTH", "700"))
+
 def get_google_creds():
-    creds = None
-    # use this if service account
-    # creds = service_account.Credentials.from_service_account_file(
-    #     filename="sa-key.json",
-    #     scopes=SCOPES)
-    # use this if desktop app
-    if os.path.exists(os.path.join(current_path, "token.json")):
-        creds = Credentials.from_authorized_user_file(os.path.join(current_path, "token.json"), SCOPES)
-    # If there are no (valid) credentials available, let the user log in.
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                os.path.join(current_path, "credentials.json"), SCOPES
-            )
-            creds = flow.run_local_server(port=0)
-        # Save the credentials for the next run
-        with open(os.path.join(current_path, "token.json"), "w") as token:
-            token.write(creds.to_json())
-    return creds
+    key_path = os.path.join(current_path, SERVICE_ACCOUNT_FILE)
+    if not os.path.exists(key_path):
+        raise FileNotFoundError(f"Service account key not found: {key_path}")
+    return service_account.Credentials.from_service_account_file(key_path, scopes=SCOPES)
 
 def get_file_id_from_drive(file_path):
     creds = get_google_creds()
@@ -98,23 +94,24 @@ def get_file_id_from_drive(file_path):
         parent_id = SHARED_DRIVE_ID
         for index in range(len(file_parts)-1):
             parents = service.files().list(q = f"name = '{file_parts[index]}' and parents = '{parent_id}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false", driveId=SHARED_DRIVE_ID, includeItemsFromAllDrives=True, corpora="drive", supportsAllDrives=True).execute()
+            if not parents["files"]:
+                raise FileNotFoundError(f"Folder '{file_parts[index]}' not found in shared drive")
             parent_id = parents["files"][0]["id"]
         files = service.files().list(q = f"name = '{file_parts[-1]}' and parents = '{parent_id}' and trashed = false", driveId=SHARED_DRIVE_ID, includeItemsFromAllDrives=True, corpora="drive", supportsAllDrives=True).execute()
+        if not files["files"]:
+            raise FileNotFoundError(f"File '{file_parts[-1]}' not found in shared drive")
         file_id = files["files"][0]["id"]
         return file_id
     except Exception as e:
         logger.error(f"Failed to get file id from google drive: {e}")
+        raise
 
 
 def download_from_drive(file_id):
     """Downloads a file
     Args:
     file_id: ID of the file to download
-    Returns : IO object with location.
-
-    Load pre-authorized user credentials from the environment.
-    TODO(developer) - See https://developers.google.com/identity
-    for guides on implementing OAuth2 for the application.
+    Returns : the file contents as bytes.
     """
     creds = get_google_creds()
 
@@ -135,6 +132,7 @@ def download_from_drive(file_id):
 
     except Exception as e:
         logger.error(f"Failed to download file from google drive: {e}")
+        raise
 
 def extract_img_from_worksheet(file_path):
     file_id = get_file_id_from_drive(file_path)
@@ -150,6 +148,8 @@ def extract_img_from_worksheet(file_path):
 
     # Get the first worksheet
     sheet = workbook.worksheets.get(DATE_FORMAT_3)
+    if sheet is None:
+        raise ValueError(f"Worksheet '{DATE_FORMAT_3}' not found in {file_path}")
 
     # Set all margins of the worksheet to zero
     sheet.page_setup.left_margin = 0.0
@@ -157,10 +157,14 @@ def extract_img_from_worksheet(file_path):
     sheet.page_setup.top_margin = 0.0
     sheet.page_setup.right_margin = 0.0
 
+    # max_data_row is 0-based, so add 1 to get the last used row number
+    last_row = sheet.cells.max_data_row + 1
     row_start = 2
     sheet_range_date = sheet.cells.get(f"D{row_start}").display_string_value
     while sheet_range_date != DATE_FORMAT_1:
         row_start = row_start + 10
+        if row_start > last_row:
+            raise ValueError(f"Date '{DATE_FORMAT_1}' not found in column D of worksheet '{DATE_FORMAT_3}'")
         sheet_range_date = sheet.cells.get(f"D{row_start}").display_string_value
     row_start = row_start - 1
     row_end = row_start + 9
@@ -174,18 +178,8 @@ def extract_img_from_worksheet(file_path):
     return image_path
 
 def send_email(image_path):
-    """Create and send an email message
-    Print the returned  message id
-    Returns: Message object, including message id
-
-    Load pre-authorized user credentials from the environment.
-    TODO(developer) - See https://developers.google.com/identity
-    for guides on implementing OAuth2 for the application.
-    """
-    creds = get_google_creds()
-
+    """Create and send an email message through Gmail SMTP using an app password."""
     try:
-        service = build("gmail", "v1", credentials=creds)
         message = EmailMessage()
         message["To"] = MESSAGE_TO
         if MESSAGE_CC:
@@ -194,23 +188,17 @@ def send_email(image_path):
 
         message["Subject"] = f"{EMAIL_SUBJECT} - {DATE_FORMAT_1}"
 
-        with Image.open(image_path) as img:
-            # Save the image data to a bytes buffer in the correct format
-            buffer = io.BytesIO()
-            img.save(buffer, format="png")
-            img_bytes = buffer.getvalue()
-            
-            # Encode the bytes to a Base64 string
-            base64_encoded_bytes = base64.b64encode(img_bytes)
-            base64_string = base64_encoded_bytes.decode('utf-8')
-            
-            # Construct the full Data URL
-            data_url = f"data:image/png;base64,{base64_string}"
+        with open(image_path, "rb") as file:
+            img_bytes = file.read()
+
+        # Email clients block data: URLs, so the body references the image by Content-ID
+        image_cid = make_msgid(domain="report.local")
 
         report_link_html = ""
         if REPORT_LINK:
-            report_link_html = f"""<div>Report Link:
-            <a href="{REPORT_LINK}" target="_blank">Click Me!</a>
+            link = html.escape(REPORT_LINK)
+            report_link_html = f"""<div>{html.escape(REPORT_LINK_LABEL)}:
+            <a href="{link}" target="_blank">{link}</a>
             </div>"""
 
         message_content = f"""
@@ -219,7 +207,7 @@ def send_email(image_path):
             <br>
             Please find below today's {REPORT_NAME} as of {DATE_FORMAT_1}.
             <br>
-            <img alt="image.png" src="{data_url}" />
+            <img alt="{REPORT_NAME}" src="cid:{image_cid[1:-1]}" width="{EMAIL_IMAGE_WIDTH}" style="width: {EMAIL_IMAGE_WIDTH}px; max-width: 100%; height: auto;" />
             <br>
             {report_link_html}
             <div>
@@ -230,24 +218,18 @@ def send_email(image_path):
             </div>
             """
         message.set_content(message_content, subtype="html")
+        message.add_related(img_bytes, maintype="image", subtype="png", cid=image_cid)
 
-        with open(image_path, "rb") as file:
-            attachment_data = file.read()
-        message.add_attachment(attachment_data, maintype="imageg", subtype="png", filename=f"{DATE_FORMAT_2}.png")
+        message.add_attachment(img_bytes, maintype="image", subtype="png", filename=f"{DATE_FORMAT_2}.png")
 
-        # encoded message
-        encoded_message = base64.urlsafe_b64encode(bytes(message.as_string(), "utf-8")).decode("utf-8")
-
-        create_message = {"raw": encoded_message}
-        # pylint: disable=E1101
-        send_message = (
-            service.users()
-            .messages()
-            .send(userId="me", body=create_message)
-            .execute()
-        )
+        # send_message delivers to everyone in the To and Cc headers
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as smtp:
+            # Log in with the bare address, even if MESSAGE_FROM includes a display name
+            smtp.login(parseaddr(MESSAGE_FROM)[1], GMAIL_APP_PASSWORD)
+            smtp.send_message(message)
     except Exception as e:
         logger.error(f"Failed to send email: {e}")
+        raise
 
 def run_with_retry(num_tries: int, wait_time: float):
     """
@@ -267,6 +249,7 @@ def run_with_retry(num_tries: int, wait_time: float):
                 time.sleep(wait_time)
             else:
                 logger.error(f"Failed to run the program after {num_tries} tries.")
+                raise SystemExit(1)
 
 def main():
     """
@@ -288,7 +271,21 @@ def main():
         logger.error(f"An error occurred: {e}")
         raise
 
+def date(value):
+    return datetime.datetime.strptime(value, "%Y-%m-%d")
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Screenshot a day's report block and email it.")
+    parser.add_argument(
+        "--date",
+        type=date,
+        help="report date as YYYY-MM-DD (default: today)",
+    )
+    args = parser.parse_args()
+    if args.date:
+        set_report_date(args.date)
+    logger.info(f"Report date: {DATE_FORMAT_1}")
+
     # Number of tries and time to wait in between retries
     number_of_tries = 5
     waiting_time = 60
