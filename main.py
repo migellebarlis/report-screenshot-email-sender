@@ -7,6 +7,7 @@ from email.message import EmailMessage
 
 from PIL import Image
 from loguru import logger
+from dotenv import load_dotenv
 
 import google.auth
 from google.oauth2 import service_account
@@ -24,6 +25,15 @@ from aspose.cells.rendering import ImageOrPrintOptions, SheetRender
 # Get the path of the current file
 current_path = os.path.dirname(os.path.abspath(__file__))
 
+# Load settings from .env in the project folder (see .env.example)
+load_dotenv(os.path.join(current_path, ".env"))
+
+def get_env(name, default=None):
+    value = os.getenv(name) or default
+    if not value:
+        raise SystemExit(f"Missing required setting {name} in .env (see .env.example)")
+    return value
+
 # Get date today
 DATE = datetime.datetime.now()
 DATE_FORMAT_1 = f"{DATE.strftime('%B')} {DATE.day}, {DATE.year}"
@@ -36,15 +46,20 @@ SCOPES = [
     "https://mail.google.com/"
 ]
 
-SHARED_DRIVE_ID = "sample_drive_id"
+SHARED_DRIVE_ID = get_env("SHARED_DRIVE_ID")
 
-FILE_PATH = "sample.xlsx"
+FILE_PATH = get_env("FILE_PATH")
 
-TEMP_IMAGE_FILE_NAME = "image.png"
+TEMP_IMAGE_FILE_NAME = get_env("TEMP_IMAGE_FILE_NAME", "image.png")
 
-MESSAGE_TO = "sample@gmail.com"
-MESSAGE_CC = "sample@gmail.com"
-MESSAGE_FROM = "sample@gmail.com"
+MESSAGE_TO = get_env("MESSAGE_TO")
+MESSAGE_CC = os.getenv("MESSAGE_CC", "")
+MESSAGE_FROM = get_env("MESSAGE_FROM")
+
+EMAIL_SUBJECT = get_env("EMAIL_SUBJECT", "Sample")
+REPORT_NAME = get_env("REPORT_NAME", "sample report")
+REPORT_LINK = os.getenv("REPORT_LINK", "")
+SENDER_NAME = get_env("SENDER_NAME", "Sample")
 
 def get_google_creds():
     creds = None
@@ -173,10 +188,11 @@ def send_email(image_path):
         service = build("gmail", "v1", credentials=creds)
         message = EmailMessage()
         message["To"] = MESSAGE_TO
-        message["Cc"] = MESSAGE_CC
+        if MESSAGE_CC:
+            message["Cc"] = MESSAGE_CC
         message["From"] = MESSAGE_FROM
 
-        message["Subject"] = f"Sample - {DATE_FORMAT_1}"
+        message["Subject"] = f"{EMAIL_SUBJECT} - {DATE_FORMAT_1}"
 
         with Image.open(image_path) as img:
             # Save the image data to a bytes buffer in the correct format
@@ -191,21 +207,26 @@ def send_email(image_path):
             # Construct the full Data URL
             data_url = f"data:image/png;base64,{base64_string}"
 
+        report_link_html = ""
+        if REPORT_LINK:
+            report_link_html = f"""<div>Report Link:
+            <a href="{REPORT_LINK}" target="_blank">Click Me!</a>
+            </div>"""
+
         message_content = f"""
             Hi,
             <br>
             <br>
-            Please find below today's sample report as of {DATE_FORMAT_1}.
+            Please find below today's {REPORT_NAME} as of {DATE_FORMAT_1}.
             <br>
             <img alt="image.png" src="{data_url}" />
             <br>
-            <div>Sample Report Link:
-            <a href="https://static.wikia.nocookie.net/crayonshinchan/images/6/6d/SHIN.png/revision/latest?cb=20200609184539" target="_blank">Click Me!</a>
-            <br>
+            {report_link_html}
+            <div>
             <br>
             Best,
             <br>
-            Sample
+            {SENDER_NAME}
             </div>
             """
         message.set_content(message_content, subtype="html")
